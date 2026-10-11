@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""Interactive, resumable local/GCP setup. Python 3 standard library only."""
+import argparse
+import getpass
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+ROOT = Path(__file__).resolve().parent
+STATE = ROOT / '.local'
+APP_SECRET_NAMES = {'CORRIDORA_INGEST_KEY', 'CORRIDORA_RUM_KEY', 'DEMO_CONTROL_TOKEN', 'DOWNSTREAM_AUTH_TOKEN'}
+SECRET_NAMES = APP_SECRET_NAMES | {'CORRIDORA_QUERY_KEY'}
+DEFAULTS = {'SAMPLE_MODE':'local','PORT':'4107','CORRIDORA_TARGET':'own',
+ 'CORRIDORA_OTLP_ENDPOINT':'https://ingest.corridora.com','CORRIDORA_RUM_SCRIPT_URL':'https://rum.corridora.com/corridora-rum.js',
+ 'CORRIDORA_INGEST_KEY':'','CORRIDORA_RUM_KEY':'','OTEL_SERVICE_NAME':'sample-recommendations-api',
+ 'OTEL_SERVICE_NAMESPACE':'corridora-samples.recommendations','DEPLOYMENT_ENVIRONMENT':'development',
+ 'SERVICE_VERSION':'local','DEMO_CONTROL_TOKEN':'','DEMO_DAILY_START_UTC':'15:00','DEMO_WINDOW_SECONDS':'600',
+ 'ENABLE_PROVIDER_FORWARDING':'false','ENABLE_SYNTHETICS':'false','REVIEW_SUMMARY_URL':'',
+ 'DOWNSTREAM_AUTH_TOKEN':'','MODEL_REVISION':'fixture-v1','GCP_PROJECT':'','GCP_REGION':'us-central1',
+ 'GCP_PREFIX':'sample-recs','GCP_BUCKET':'','GCP_SHARED_BUCKET':'false','GCP_ACCOUNT':'','PUBLIC_URL':'',
+ 'CORRIDORA_QUERY_BASE_URL':'','CORRIDORA_QUERY_KEY':''}
+
+def save(path, value):
+    STATE.mkdir(mode=0o700,exist_ok=True)
+    temp=path.with_suffix('.tmp')
+    fd=os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+    with os.fdopen(fd,'w') as out: json.dump(value,out,indent=2);out.write('\n')
+    os.chmod(temp,0o600);temp.replace(path)
+
+def load(path):
+    return json.loads(path.read_text()) if path.exists() else {}
+
+def config(args):
+    c=DEFAULTS | load(STATE/'config.json') | load(STATE/'secrets.json')
+    if args.config: c.update(load(Path(args.config)))
+    c.update({key:os.environ[key] for key in DEFAULTS if key in os.environ})
+    return c
+
+def validate(c, credentials=False):
+    if c['SAMPLE_MODE'] not in ('local','cloud'): raise ValueError('SAMPLE_MODE must be local or cloud')
+    if c['CORRIDORA_TARGET'] not in ('own','demo'): raise ValueError('CORRIDORA_TARGET must be own or demo')
+    for name in ('CORRIDORA_OTLP_ENDPOINT','CORRIDORA_RUM_SCRIPT_URL','REVIEW_SUMMARY_URL','CORRIDORA_QUERY_BASE_URL','PUBLIC_URL'):
+        value=c[name]
+        if not value: continue
+        u=urllib.parse.urlparse(value)
+        if not u.hostname or u.username or u.password or u.query or u.fragment or (u.scheme!='https' and not (u.scheme=='http' and u.hostname in ('localhost','127.0.0.1'))):
+            raise ValueError(f'{name} needs HTTPS (or local loopback HTTP), no userinfo/query/fragment')
+    if c['REVIEW_SUMMARY_URL'] and urllib.parse.urlparse(c['REVIEW_SUMMARY_URL']).path!='/internal/review-summary': raise ValueError('Use the AWS leaf /internal/review-summary endpoint; no recursive recommendation calls')
+    if not 1<=int(c['PORT'])<=65535 or not 1<=int(c['DEMO_WINDOW_SECONDS'])<=600: raise ValueError('Invalid port/window')
+    time.strptime(c['DEMO_DAILY_START_UTC'],'%H:%M')
+    if credentials and (not c['DEMO_CONTROL_TOKEN'] or not c['CORRIDORA_INGEST_KEY'] or not c['CORRIDORA_RUM_KEY']):
+        raise ValueError('Set DEMO_CONTROL_TOKEN, CORRIDORA_INGEST_KEY and CORRIDORA_RUM_KEY from your organization (Demo requires operator-issued keys)')
+    if c['SAMPLE_MODE']=='cloud':
+        if not re.fullmatch(r'[a-z][a-z0-9-]{4,28}[a-z0-9]',c['GCP_PROJECT']): raise ValueError('Set a valid existing billed GCP_PROJECT')
+        if not re.fullmatch(r'[a-z][a-z0-9-]{2,19}',c['GCP_PREFIX']): raise ValueError('GCP_PREFIX must be 3..20 lowercase letters/digits/hyphens')
+        if c['GCP_SHARED_BUCKET']=='true' and not c['GCP_BUCKET']: raise ValueError('Select the existing shared GCP_BUCKET explicitly')
+
+def configure(c,args):
+    if not args.non_interactive:
+        print('Contributors use their own Corridora tenant. Demo keys must be provisioned by an authorized operator.')
+        names=['SAMPLE_MODE','CORRIDORA_TARGET','CORRIDORA_OTLP_ENDPOINT','CORRIDORA_RUM_SCRIPT_URL','CORRIDORA_INGEST_KEY','CORRIDORA_RUM_KEY','OTEL_SERVICE_NAME','OTEL_SERVICE_NAMESPACE','DEPLOYMENT_ENVIRONMENT','PORT','DEMO_CONTROL_TOKEN','DEMO_DAILY_START_UTC','DEMO_WINDOW_SECONDS','ENABLE_PROVIDER_FORWARDING','ENABLE_SYNTHETICS','MODEL_REVISION','REVIEW_SUMMARY_URL','DOWNSTREAM_AUTH_TOKEN','CORRIDORA_QUERY_BASE_URL','CORRIDORA_QUERY_KEY']
+        for key in names:
+            default=c[key]
+            if key=='DEMO_CONTROL_TOKEN' and not default: default=secrets.token_urlsafe(32)
+            display='saved/generated' if key in SECRET_NAMES and default else default
+            prompt=f'{key} [{display}]: '
+            answer=getpass.getpass(prompt) if key in SECRET_NAMES else input(prompt)
+            c[key]=answer.strip() or default
+        if c['SAMPLE_MODE']=='cloud':
+            print('Use gcloud auth login; no account password is requested. Project and shared resources will never be deleted.')
+            for key in ['GCP_ACCOUNT','GCP_PROJECT','GCP_REGION','GCP_PREFIX','GCP_SHARED_BUCKET','GCP_BUCKET']:
+                c[key]=input(f'{key} [{c[key]}]: ').strip() or c[key]
+    if c['CORRIDORA_TARGET']=='demo': c['DEPLOYMENT_ENVIRONMENT']='demo'
+    validate(c,credentials=True)
+    save(STATE/'config.json',{k:v for k,v in c.items() if k not in SECRET_NAMES})
+    save(STATE/'secrets.json',{k:v for k,v in c.items() if k in SECRET_NAMES})
+    print('Saved .local/config.json and owner-only .local/secrets.json. No credentials are public frontend build variables.')
+
+def run_cmd(argv,c,cwd=ROOT,capture=False,stdin=None,allow_failure=False):
+    env=os.environ | {k:str(v) for k,v in c.items()}
+    env.pop('CORRIDORA_QUERY_KEY',None);env.pop('CORRIDORA_QUERY_BASE_URL',None)
+    proc=subprocess.run(list(map(str,argv)),cwd=cwd,env=env,text=True,input=stdin,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    output=(proc.stdout or '')+(proc.stderr or '')
+    for name in SECRET_NAMES:
+        if c.get(name): output=output.replace(c[name],'[REDACTED]')
+    if not capture and output: print(output,end='')
+    if proc.returncode and not allow_failure: raise RuntimeError(f'{argv[0]} failed ({proc.returncode}): {output[-2000:]}')
+    return proc.returncode,proc.stdout.strip()
+
+def executable(name):
+    value=shutil.which(name)
+    if value: return value
+    if name=='mvn':
+        values=list((ROOT/'.tools').glob('apache-maven-*/bin/mvn'))
+        if values: return str(values[0])
+    raise ValueError(f'Install {name} first; see README prerequisites')
+
+def environment(c):
+    e=os.environ|c
+    e.pop('CORRIDORA_QUERY_KEY',None);e.pop('CORRIDORA_QUERY_BASE_URL',None)
+    e['SAMPLE_CSP']=csp(c)
+    tools=list((ROOT/'.tools').glob('jdk-*/Contents/Home'))
+    if tools and not os.environ.get('JAVA_HOME'): e['JAVA_HOME']=str(tools[0]);e['PATH']=str(tools[0]/'bin')+os.pathsep+e['PATH']
+    return e
+
+def csp(c):
+    def origin(value):
+        u=urllib.parse.urlparse(value);return f'{u.scheme}://{u.netloc}'
+    return f"default-src 'self'; script-src 'self' {origin(c['CORRIDORA_RUM_SCRIPT_URL'])}; connect-src 'self' {origin(c['CORRIDORA_OTLP_ENDPOINT'])}; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+
+def version(c):
+    code,value=run_cmd(['git','rev-parse','HEAD'],c,capture=True,allow_failure=True)
+    _,dirty=run_cmd(['git','status','--porcelain'],c,capture=True,allow_failure=True)
+    if not code and not dirty:return value
+    import hashlib
+    h=hashlib.sha256();files=[]
+    for relative in ('src/main/java','src/main/resources/application.properties','web/src','web/index.html','web/package-lock.json','web/vite.config.ts','web/tsconfig.json','pom.xml','Dockerfile'):
+        path=ROOT/relative;files.extend([p for p in path.rglob('*') if p.is_file()] if path.is_dir() else [path])
+    for path in sorted(files):h.update(path.relative_to(ROOT).as_posix().encode());h.update(path.read_bytes())
+    return ('source-' if code else value[:12]+'-dirty-')+h.hexdigest()[:16]
+
+def build(c):
+    run_cmd(['npm','ci','--ignore-scripts'],c,cwd=ROOT/'web')
+    run_cmd(['npm','run','build'],c,cwd=ROOT/'web')
+    target=ROOT/'src/main/resources/META-INF/resources'
+    if target.exists():shutil.rmtree(target)
+    shutil.copytree(ROOT/'web/dist',target)
+    run_cmd([executable('mvn'),'-B','package'],environment(c))
+    run_cmd([sys.executable,'scripts/check-java-lock.py'],c)
+    import hashlib
+    app=ROOT/'target/quarkus-app/app/sample-recommendations-1.0.0.jar'
+    save(STATE/'build.json',{'service_version':version(c),'app_jar_sha256':hashlib.sha256(app.read_bytes()).hexdigest()})
+
+def built_version(c):
+    import hashlib
+    stamp=load(STATE/'build.json');app=ROOT/'target/quarkus-app/app/sample-recommendations-1.0.0.jar'
+    if not app.exists() or not stamp or stamp.get('app_jar_sha256')!=hashlib.sha256(app.read_bytes()).hexdigest():
+        build(c);stamp=load(STATE/'build.json')
+    return stamp['service_version']
+
+def plan(c):
+    p=c['GCP_PREFIX'];project=c['GCP_PROJECT'];bucket=c['GCP_BUCKET'] or f'{project}-{p}'
+    return {'project':project,'region':c['GCP_REGION'],'service':p,'service_identity':p+'-run','push_identity':p+'-push','bucket':bucket,'object_prefix':f'recommendations/{p}/','bucket_shared':c['GCP_SHARED_BUCKET']=='true','refresh_topic':p+'-refresh','dlq_topic':p+'-dlq','secret':p+'-config','artifact_repository':p,'scheduler':p+'-tick','provider_forwarding':c['ENABLE_PROVIDER_FORWARDING']=='true','cost':'$0–2/month shared GCP baseline at tiny traffic; Cloud Build/egress/secrets/images meter separately; alerts are not hard caps','limits':{'min_instances':0,'max_instances':2,'memory':'512Mi','cpu':1,'concurrency':8,'timeout_seconds':20}}
+
+def cloud_deploy(c,args):
+    validate(c,credentials=not args.plan)
+    spec=plan(c)
+    print(json.dumps(spec,indent=2))
+    if args.plan:return
+    if not shutil.which('gcloud'):raise ValueError('Install gcloud and log in with gcloud auth login')
+    account_filter='account='+c['GCP_ACCOUNT'] if c.get('GCP_ACCOUNT') else 'status:ACTIVE'
+    _,account=run_cmd(['gcloud','auth','list','--filter='+account_filter,'--format=value(account)'],c,capture=True)
+    if not account:raise ValueError('No active gcloud identity')
+    print('Authenticated deployment account:',account)
+    if not args.non_interactive and input('Apply this plan? [y/N]: ').lower()!='y':return
+    inv=load(STATE/'inventory.json')
+    if inv and (inv.get('project')!=c['GCP_PROJECT'] or inv.get('prefix')!=c['GCP_PREFIX']):raise ValueError('Existing inventory belongs to another project/prefix; use another checkout')
+    inv.setdefault('project',c['GCP_PROJECT']);inv.setdefault('prefix',c['GCP_PREFIX']);inv.setdefault('resources',[])
+    def gc(*argv,**kwargs):return run_cmd(['gcloud',*argv,'--project',c['GCP_PROJECT'],'--quiet',*(['--account',c['GCP_ACCOUNT']] if c.get('GCP_ACCOUNT') else [])],c,**kwargs)
+    def ensure(kind,name,describe,create,shared=False):
+        code,_=gc(*describe,capture=True,allow_failure=True)
+        tracked=any(r['kind']==kind and r['name']==name for r in inv['resources'])
+        if code:
+            gc(*create);inv['resources'].append({'kind':kind,'name':name,'owned':True});save(STATE/'inventory.json',inv)
+        elif not tracked:
+            if not shared:raise ValueError(f'{kind} {name} already exists but is not owned by this checkout; choose another prefix')
+            inv['resources'].append({'kind':kind,'name':name,'owned':False});save(STATE/'inventory.json',inv)
+    gc('services','enable','run.googleapis.com','artifactregistry.googleapis.com','cloudbuild.googleapis.com','pubsub.googleapis.com','secretmanager.googleapis.com','cloudscheduler.googleapis.com','logging.googleapis.com','monitoring.googleapis.com','storage.googleapis.com')
+    p=c['GCP_PREFIX'];project=c['GCP_PROJECT'];region=c['GCP_REGION'];bucket=spec['bucket']
+    run_sa=f'{p}-run@{project}.iam.gserviceaccount.com';push_sa=f'{p}-push@{project}.iam.gserviceaccount.com'
+    for name in (p+'-run',p+'-push',p+'-build'):
+        email=f'{name}@{project}.iam.gserviceaccount.com'
+        ensure('service-account',email,['iam','service-accounts','describe',email],['iam','service-accounts','create',name,'--display-name',p])
+    ensure('bucket',bucket,['storage','buckets','describe','gs://'+bucket],['storage','buckets','create','gs://'+bucket,'--location',region,'--uniform-bucket-level-access'],shared=spec['bucket_shared'])
+    # Shared buckets keep all other samples' data and IAM. Prefix-scoped condition restricts object writes.
+    object_prefix=spec['object_prefix'];inv['object_prefix']=object_prefix;save(STATE/'inventory.json',inv)
+    condition=f'expression=resource.name.startsWith("projects/_/buckets/{bucket}/objects/{object_prefix}"),title=recommendations-prefix'
+    gc('storage','buckets','add-iam-policy-binding','gs://'+bucket,'--member','serviceAccount:'+run_sa,'--role','roles/storage.objectUser','--condition',condition)
+    build_sa=f'{p}-build@{project}.iam.gserviceaccount.com'
+    gc('storage','buckets','add-iam-policy-binding','gs://'+bucket,'--member','serviceAccount:'+build_sa,'--role','roles/storage.objectViewer','--condition',condition)
+    for topic in (p+'-refresh',p+'-dlq',p+'-logs'):
+        ensure('topic',topic,['pubsub','topics','describe',topic],['pubsub','topics','create',topic,'--message-retention-duration','1d'])
+    gc('pubsub','topics','add-iam-policy-binding',p+'-refresh','--member','serviceAccount:'+run_sa,'--role','roles/pubsub.publisher')
+    ensure('secret',p+'-config',['secrets','describe',p+'-config'],['secrets','create',p+'-config','--replication-policy','automatic'])
+    gc('secrets','versions','add',p+'-config','--data-file','-',stdin=json.dumps({k:c[k] for k in APP_SECRET_NAMES}))
+    gc('secrets','add-iam-policy-binding',p+'-config','--member','serviceAccount:'+run_sa,'--role','roles/secretmanager.secretAccessor')
+    ensure('artifact-repository',p,['artifacts','repositories','describe',p,'--location',region],['artifacts','repositories','create',p,'--repository-format','docker','--location',region])
+    gc('artifacts','repositories','add-iam-policy-binding',p,'--location',region,'--member','serviceAccount:'+build_sa,'--role','roles/artifactregistry.writer')
+    gc('projects','add-iam-policy-binding',project,'--member','serviceAccount:'+build_sa,'--role','roles/logging.logWriter','--condition=None')
+    inv['build_logging_binding']=True;save(STATE/'inventory.json',inv)
+    gc('artifacts','repositories','set-cleanup-policies',p,'--location',region,'--policy',ROOT/'infra/artifact-cleanup.json','--no-dry-run')
+    c['SERVICE_VERSION']=version(c);image=f'{region}-docker.pkg.dev/{project}/{p}/app:{c["SERVICE_VERSION"]}'
+    gc('builds','submit',str(ROOT),'--config',ROOT/'infra/cloudbuild.yaml','--substitutions','_IMAGE='+image,'--service-account',f'projects/{project}/serviceAccounts/{build_sa}','--gcs-source-staging-dir',f'gs://{bucket}/{object_prefix}builds','--timeout','1200')
+    cloud_config={k:v for k,v in c.items() if k not in SECRET_NAMES}
+    cloud_config.pop('CORRIDORA_QUERY_BASE_URL',None)
+    cloud_config.pop('PORT',None)  # Cloud Run reserves/injects PORT itself.
+    cloud_config['SAMPLE_CSP']=csp(c)
+    cloud_config.update({'GCP_BUCKET':bucket,'GCP_OBJECT_PREFIX':object_prefix,'GCP_SERVICE':p,'GCP_REFRESH_TOPIC':p+'-refresh','GCP_PUSH_IDENTITY':push_sa,'SAMPLE_SECRET_FILE':'/secrets/config.json'})
+    # JSON is valid YAML; avoids gcloud comma-delimiter parsing for arbitrary values.
+    save(STATE/'cloud-env.json',cloud_config)
+    code,_=gc('run','services','describe',p,'--region',region,capture=True,allow_failure=True)
+    if not code and not any(r['kind']=='run-service' for r in inv['resources']):raise ValueError('Cloud Run name exists without ownership inventory')
+    gc('run','deploy',p,'--region',region,'--image',image,'--service-account',run_sa,'--allow-unauthenticated','--min-instances','0','--max-instances','2','--memory','512Mi','--cpu','1','--concurrency','8','--timeout','20','--env-vars-file',STATE/'cloud-env.json','--update-secrets',f'/secrets/config.json={p}-config:latest')
+    if code: inv['resources'].append({'kind':'run-service','name':p,'owned':True});save(STATE/'inventory.json',inv)
+    _,url=gc('run','services','describe',p,'--region',region,'--format=value(status.url)',capture=True)
+    c['PUBLIC_URL']=url;cloud_config['PUBLIC_URL']=url;save(STATE/'cloud-env.json',cloud_config)
+    gc('run','services','update',p,'--region',region,'--env-vars-file',STATE/'cloud-env.json')
+    # The volume uses latest; retain one active version to bound Secret Manager cost.
+    _,versions=gc('secrets','versions','list',p+'-config','--filter=state:ENABLED','--format=value(name)','--sort-by=~createTime',capture=True)
+    for old in versions.splitlines()[1:]:gc('secrets','versions','destroy',old.rsplit('/',1)[-1],'--secret',p+'-config')
+    gc('run','services','add-iam-policy-binding',p,'--region',region,'--member','serviceAccount:'+push_sa,'--role','roles/run.invoker')
+    _,number=gc('projects','describe',project,'--format=value(projectNumber)',capture=True)
+    agent=f'service-{number}@gcp-sa-pubsub.iam.gserviceaccount.com'
+    gc('iam','service-accounts','add-iam-policy-binding',push_sa,'--member','serviceAccount:'+agent,'--role','roles/iam.serviceAccountTokenCreator')
+    gc('pubsub','topics','add-iam-policy-binding',p+'-dlq','--member','serviceAccount:'+agent,'--role','roles/pubsub.publisher')
+    for suffix,path in (('refresh','/internal/pubsub'),('logs','/internal/provider-logs')):
+        sub=p+'-'+suffix+'-push'
+        ensure('subscription',sub,['pubsub','subscriptions','describe',sub],['pubsub','subscriptions','create',sub,'--topic',p+'-'+suffix,'--push-endpoint',url+path,'--push-auth-service-account',push_sa,'--push-auth-token-audience',url,'--ack-deadline','20','--dead-letter-topic',p+'-dlq','--max-delivery-attempts','5','--min-retry-delay','5s','--max-retry-delay','30s','--message-retention-duration','1d'])
+        gc('pubsub','subscriptions','add-iam-policy-binding',sub,'--member','serviceAccount:'+agent,'--role','roles/pubsub.subscriber')
+    ensure('subscription',p+'-dead',['pubsub','subscriptions','describe',p+'-dead'],['pubsub','subscriptions','create',p+'-dead','--topic',p+'-dlq','--message-retention-duration','1d'])
+    ensure('scheduler',p+'-tick',['scheduler','jobs','describe',p+'-tick','--location',region],['scheduler','jobs','create','http',p+'-tick','--location',region,'--schedule','*/15 * * * *','--time-zone','UTC','--uri',url+'/internal/tick','--http-method','POST','--oidc-service-account-email',push_sa,'--oidc-token-audience',url,'--attempt-deadline','20s','--max-retry-attempts','2'])
+    if c['ENABLE_PROVIDER_FORWARDING']=='true':
+        # Exclude adapter endpoints to prevent the log sink recursively exporting itself.
+        filt=f'resource.type="cloud_run_revision" AND resource.labels.service_name="{p}" AND logName:"run.googleapis.com%2Frequests" AND NOT httpRequest.requestUrl:"/internal/"'
+        ensure('sink',p+'-requests',['logging','sinks','describe',p+'-requests'],['logging','sinks','create',p+'-requests',f'pubsub.googleapis.com/projects/{project}/topics/{p}-logs','--log-filter',filt])
+        _,writer=gc('logging','sinks','describe',p+'-requests','--format=value(writerIdentity)',capture=True)
+        gc('pubsub','topics','add-iam-policy-binding',p+'-logs','--member',writer,'--role','roles/pubsub.publisher')
+        gc('projects','add-iam-policy-binding',project,'--member','serviceAccount:'+run_sa,'--role','roles/monitoring.viewer','--condition=None')
+        inv['monitoring_binding']=True;save(STATE/'inventory.json',inv)
+    c['GCP_BUCKET']=bucket
+    save(STATE/'config.json',{k:v for k,v in c.items() if k not in SECRET_NAMES})
+    print('Deployed:',url,'\nConfigure GitHub synthetic secrets from docs/deployment.md; hosted daily browser evidence is not yet verified.')
+
+def api(c,path,data=None):
+    base=c.get('PUBLIC_URL') if c['SAMPLE_MODE']=='cloud' else f'http://127.0.0.1:{c["PORT"]}'
+    if not base: raise ValueError('Missing deployed PUBLIC_URL; run deploy first')
+    req=urllib.request.Request(base+path,data=json.dumps(data).encode() if data is not None else None,headers={'Authorization':'Bearer '+c['DEMO_CONTROL_TOKEN'],'Content-Type':'application/json'})
+    with urllib.request.urlopen(req,timeout=20) as response:return json.load(response)
+
+def stored_correlation(c,trace_id):
+    if not c.get('CORRIDORA_QUERY_KEY') or not c.get('CORRIDORA_QUERY_BASE_URL'):
+        print('Stored Corridora query verification pending: set optional CORRIDORA_QUERY_BASE_URL + organization View CORRIDORA_QUERY_KEY, or finish the UI steps in docs/corridora-setup.md.')
+        return False
+    if not re.fullmatch('[0-9a-f]{32}',trace_id):raise ValueError('Expected a recovered browser trace ID')
+    url=c['CORRIDORA_QUERY_BASE_URL'].rstrip('/')+'/web/api/v1/traces/'+trace_id
+    for attempt in range(6):
+        req=urllib.request.Request(url,headers={'X-Corridora-Api-Key':c['CORRIDORA_QUERY_KEY']})
+        try:
+            with urllib.request.urlopen(req,timeout=3) as response:envelope=json.load(response)
+            spans=envelope.get('spans',[])
+            clients=[s for s in spans if s.get('service_name')=='sample-recommendations-web' and s.get('kind') in (3,'CLIENT','client','SPAN_KIND_CLIENT')]
+            servers=[s for s in spans if s.get('service_name')==c['OTEL_SERVICE_NAME'] and s.get('kind') in (2,'SERVER','server','SPAN_KIND_SERVER')]
+            for client in clients:
+                for server in servers:
+                    if client.get('trace_id')==server.get('trace_id')==trace_id and server.get('parent_span_id')==client.get('span_id'):
+                        print('Stored Corridora CLIENT → SERVER parentage verified for',trace_id);return True
+        except (urllib.error.URLError,json.JSONDecodeError):pass
+        if attempt<5:time.sleep(1)
+    raise RuntimeError('Stored trace did not contain matching browser CLIENT → API SERVER parentage within the bounded query window; inspect UI/ingestion/key scope')
+
+def destroy(c,args):
+    inv=load(STATE/'inventory.json')
+    if not inv:print('No owned cloud resources in this checkout.');return
+    print(json.dumps(inv,indent=2))
+    if args.plan:return
+    if not args.non_interactive and input('Delete only these owned sample resources? [y/N]: ').lower()!='y':return
+    p=inv['prefix'];project=inv['project'];region=c['GCP_REGION'];object_prefix=inv.get('object_prefix',f'recommendations/{p}/')
+    def gc(*argv):return run_cmd(['gcloud',*argv,'--project',project,'--quiet'],c,allow_failure=True)
+    if inv.get('monitoring_binding'):
+        gc('projects','remove-iam-policy-binding',project,'--member',f'serviceAccount:{p}-run@{project}.iam.gserviceaccount.com','--role','roles/monitoring.viewer','--condition=None')
+    if inv.get('build_logging_binding'):
+        gc('projects','remove-iam-policy-binding',project,'--member',f'serviceAccount:{p}-build@{project}.iam.gserviceaccount.com','--role','roles/logging.logWriter','--condition=None')
+    # A bucket created here may have subsequently been reused by another sample.
+    # Preserve it if any foreign object exists; lack of listing permission blocks deletion.
+    for r in inv['resources']:
+        if r['kind']=='bucket' and r['owned']:
+            code,raw=gc('storage','objects','list','gs://'+r['name'],'--format=json(name)')
+            if code:raise RuntimeError('Cannot inventory bucket contents safely; no bucket deletion attempted')
+            if any(not item.get('name','').startswith(object_prefix) for item in json.loads(raw)):
+                r['owned']=False;save(STATE/'inventory.json',inv);print('Preserving bucket now shared with another prefix:',r['name'])
+    shared_cleaned=False
+    def clean_shared():
+        for r in inv['resources']:
+            if r['kind']=='bucket' and not r['owned']:
+                gc('storage','rm','--recursive',f'gs://{r["name"]}/{object_prefix}')
+                cond=f'expression=resource.name.startsWith("projects/_/buckets/{r["name"]}/objects/{object_prefix}"),title=recommendations-prefix'
+                gc('storage','buckets','remove-iam-policy-binding','gs://'+r['name'],'--member',f'serviceAccount:{p}-run@{project}.iam.gserviceaccount.com','--role','roles/storage.objectUser','--condition',cond)
+                gc('storage','buckets','remove-iam-policy-binding','gs://'+r['name'],'--member',f'serviceAccount:{p}-build@{project}.iam.gserviceaccount.com','--role','roles/storage.objectViewer','--condition',cond)
+    for r in reversed(inv['resources'][:]):
+        if not r['owned']:continue
+        kind,name=r['kind'],r['name']
+        if kind=='service-account' and not shared_cleaned:clean_shared();shared_cleaned=True
+        commands={'scheduler':['scheduler','jobs','delete',name,'--location',region],'sink':['logging','sinks','delete',name],'subscription':['pubsub','subscriptions','delete',name],'run-service':['run','services','delete',name,'--region',region],'topic':['pubsub','topics','delete',name],'secret':['secrets','delete',name],'artifact-repository':['artifacts','repositories','delete',name,'--location',region],'service-account':['iam','service-accounts','delete',name],'bucket':['storage','rm','--recursive','gs://'+name]}
+        code,_=gc(*commands[kind])
+        if code:raise RuntimeError(f'Teardown failed for {kind} {name}; inventory preserved for rerun')
+        inv['resources'].remove(r);save(STATE/'inventory.json',inv)
+    if not shared_cleaned:clean_shared()
+    print('Owned resources removed. Shared project, APIs, buckets and other applications remain.')
+
+def main():
+    parser=argparse.ArgumentParser(description='Configure, deploy/run and validate the Corridora SolidJS + Quarkus ranking lab.')
+    parser.add_argument('command',nargs='?',choices=['configure','deploy','run','verify','scenario','destroy'])
+    parser.add_argument('--non-interactive',action='store_true');parser.add_argument('--config');parser.add_argument('--plan','--dry-run',action='store_true')
+    parser.add_argument('--phase',choices=['healthy','regression','recover'],default='regression');parser.add_argument('--duration',type=int,default=120)
+    parser.add_argument('--watchdog',action='store_true',help='verify: replay only if no successful heartbeat today')
+    args=parser.parse_args();c=config(args)
+    if not args.command:
+        configure(c,args)
+        if c['SAMPLE_MODE']=='cloud':cloud_deploy(c,args);args.command='verify'
+        else:
+            build(c);c['SERVICE_VERSION']=built_version(c)
+            child=subprocess.Popen(['java','-jar','target/quarkus-app/quarkus-run.jar'],cwd=ROOT,env=environment(c))
+            try:
+                for _ in range(50):
+                    try:api(c,'/healthz');break
+                    except Exception:time.sleep(.2)
+                _,output=run_cmd(['npm','run','test:e2e'],environment(c)|{'BASE_URL':f'http://127.0.0.1:{c["PORT"]}'},cwd=ROOT/'web')
+                matches=re.findall(r'Recovered browser SERVER trace: ([0-9a-f]{32})',output)
+                stored_correlation(c,matches[-1] if matches else '')
+                print('App running; Ctrl+C to stop.');child.wait()
+            finally:child.terminate()
+            return
+    if args.command=='configure':configure(c,args)
+    elif args.command=='deploy':
+        if c['SAMPLE_MODE']=='cloud':cloud_deploy(c,args)
+        elif args.plan:print('Local build: npm ci → Solid/Vite build → Maven package; no cloud mutations.')
+        else:validate(c,credentials=True);build(c)
+    elif args.command=='run':
+        validate(c)
+        if c['SAMPLE_MODE']=='cloud':print(api(c,'/healthz'));print(c['PUBLIC_URL'])
+        else:
+            c['SERVICE_VERSION']=built_version(c);os.chdir(ROOT);os.execvpe('java',['java','-jar','target/quarkus-app/quarkus-run.jar'],environment(c))
+    elif args.command=='scenario':
+        validate(c,credentials=True);print(json.dumps(api(c,'/api/demo/scenario',{'phase':args.phase,'duration_seconds':args.duration}),indent=2))
+    elif args.command=='verify':
+        validate(c,credentials=True)
+        if args.watchdog:
+            heartbeat=api(c,'/api/demo/heartbeat')
+            if heartbeat.get('utc_day')==time.strftime('%Y-%m-%d',time.gmtime()) and heartbeat.get('success'):print('Successful browser journey already recorded today.');return
+            print('Missing heartbeat; replaying a fresh bounded regression and actual browser workflow.')
+        base=c['PUBLIC_URL'] if c['SAMPLE_MODE']=='cloud' else f'http://127.0.0.1:{c["PORT"]}'
+        _,output=run_cmd(['npm','run','test:e2e'],environment(c)|{'BASE_URL':base},cwd=ROOT/'web')
+        matches=re.findall(r'Recovered browser SERVER trace: ([0-9a-f]{32})',output)
+        stored_correlation(c,matches[-1] if matches else '')
+        print('Browser journey passed. See docs/corridora-setup.md for provider/application log, metric and stored UI checks.')
+    elif args.command=='destroy':destroy(c,args)
+
+if __name__=='__main__':
+    try:main()
+    except (ValueError,RuntimeError,urllib.error.URLError) as exc:print(f'Setup error: {exc}',file=sys.stderr);sys.exit(1)

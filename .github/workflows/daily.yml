@@ -1,0 +1,38 @@
+name: Daily regression and watchdog
+on:
+  schedule:
+    - cron: '1 15 * * *'
+    - cron: '20 15 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: recommendations-daily
+  cancel-in-progress: false
+jobs:
+  browser:
+    if: vars.ENABLE_SYNTHETICS == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SAMPLE_MODE: cloud
+      PUBLIC_URL: ${{ vars.SAMPLE_URL }}
+      GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+      CORRIDORA_INGEST_KEY: ${{ secrets.CORRIDORA_INGEST_KEY }}
+      CORRIDORA_RUM_KEY: ${{ secrets.CORRIDORA_RUM_KEY }}
+      DEMO_CONTROL_TOKEN: ${{ secrets.DEMO_CONTROL_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --ignore-scripts && npx playwright install --with-deps chromium
+        working-directory: web
+      - name: Replay missing heartbeat with a real browser
+        run: ./setup verify --non-interactive --watchdog
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: recommendations-failure
+          path: web/test-results
+          retention-days: 2

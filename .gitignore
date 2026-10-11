@@ -1,0 +1,11 @@
+.local/
+.tools/
+target/
+web/node_modules/
+web/dist/
+test-results/
+playwright-report/
+__pycache__/
+.env
+src/main/resources/META-INF/resources/
+*.pyc

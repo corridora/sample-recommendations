@@ -1,0 +1,4 @@
+[
+  {"name":"delete-old-images","action":{"type":"Delete"},"condition":{"tagState":"any","olderThan":"604800s"}},
+  {"name":"keep-last-three","action":{"type":"Keep"},"mostRecentVersions":{"keepCount":3}}
+]

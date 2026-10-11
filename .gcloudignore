@@ -1,0 +1,13 @@
+.git
+.tools
+.local
+.env
+*.pem
+*.key
+target
+web/node_modules
+web/dist
+test-results
+playwright-report
+**/__pycache__
+src/main/resources/META-INF/resources
